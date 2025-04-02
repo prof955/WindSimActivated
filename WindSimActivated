@@ -1,0 +1,427 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+// #include <Adafruit_SSD1306.h> // <- Remove this line
+#include <Adafruit_SH110X.h>    // <- Add this line for SH1106/SH1107
+
+// --- Pin Definitions ---
+#define POT_PIN 34
+#define SWITCH_PIN 23
+
+// --- Display Settings ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+// SH1106G typically doesn't need a reset pin connection if using I2C
+#define OLED_RESET -1
+// Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET); // <- Remove this line
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);    // <- Add this line for SH1106G
+
+// --- Simulation Settings ---
+#define NUM_DROPS 80
+#define BOUNDARY_BEHAVIOR 1
+const int WIND_COMPENSATION_BUFFER = SCREEN_WIDTH / 2;
+const int MAX_WIND_SPEED = 10;
+
+// --- Kar Birikme ve Erime Ayarları ---
+#define PLATFORM_HEIGHT 30      // Platform Yüksekliği
+// MAX_SNOW_HEIGHT: Zemin veya platform ÜZERİNDE birikebilecek maksimum kar yüksekliği
+#define MAX_SNOW_HEIGHT 15      // Bunu PLATFORM_HEIGHT'dan bağımsız ayarlayabiliriz
+#define MELT_CHECK_INTERVAL 25
+#define MELT_PROBABILITY_PERCENT 8
+#define SNOW_SPILL_THRESHOLD 1
+
+// --- Platform Ayarları ---
+#define PLATFORM_WIDTH 25
+#define PLATFORM_X (SCREEN_WIDTH - PLATFORM_WIDTH - 5)
+#define PLATFORM_Y (SCREEN_HEIGHT - PLATFORM_HEIGHT) // Üst Y koordinatı
+
+// --- Global Variables ---
+enum ParticleMode { RAIN, SNOW };
+ParticleMode currentParticleMode = RAIN;
+struct Drop { int x, y; int speed; int length; bool bouncing; int bounceCount; int bounceDirection; };
+Drop drops[NUM_DROPS];
+int windSpeed = 0;
+// snowAccumulation: y=63 (ekran altı) seviyesinden yukarı doğru toplam kar yüksekliğini tutar
+int snowAccumulation[SCREEN_WIDTH];
+unsigned long frameCounter = 0;
+
+// --- Function Prototypes ---
+void resetDrop(int i);
+void clearSnowAccumulation();
+
+// --- Setup ---
+void setup() {
+    Serial.begin(115200);
+    pinMode(POT_PIN, INPUT);
+    pinMode(SWITCH_PIN, INPUT_PULLUP);
+    randomSeed(analogRead(POT_PIN));
+
+    // Initialize the SH1106G display
+    // The parameters (voltage switch, I2C address) might need adjustment
+    // depending on your specific SH1106G module, but 0x3C is common.
+    // SSD1306_SWITCHCAPVCC is often defined generically or handled correctly
+    // by the SH110X library for internal charge pump displays.
+    if (!display.begin(0x3C,true)) { // Attempt to initialize
+        Serial.println(F("SH1106G allocation failed")); // <- Updated error message
+        for (;;); // Don't proceed, loop forever
+    }
+    Serial.println(F("SH1106G Initialized"));
+
+    // --- Logo Splash Screen ---
+    display.clearDisplay();
+    int cloudBaseX = 30; int cloudBaseY = 25; display.fillCircle(cloudBaseX, cloudBaseY, 12, SH110X_WHITE); display.fillCircle(cloudBaseX + 10, cloudBaseY - 6, 10, SH110X_WHITE); display.fillCircle(cloudBaseX + 15, cloudBaseY + 5, 9, SH110X_WHITE); display.fillCircle(cloudBaseX - 10, cloudBaseY + 3, 10, SH110X_WHITE); int windStartX = cloudBaseX + 26; int windY1 = cloudBaseY - 5; int windY2 = cloudBaseY; int windY3 = cloudBaseY + 5; display.drawLine(windStartX, windY1, windStartX + 20, windY1 - 2, SH110X_WHITE); display.drawLine(windStartX -3, windY2, windStartX + 30, windY2, SH110X_WHITE); display.drawLine(windStartX, windY3, windStartX + 25, windY3 + 2, SH110X_WHITE); display.setTextSize(1); display.setTextColor(SH110X_WHITE); display.setCursor(cloudBaseX - 5, cloudBaseY + 25); display.print(F("WindSim Activated!"));
+    // **IMPORTANT for SH1106/SH1107:** You MUST call display.display() after drawing commands
+    // to make them visible on the screen! This was already done correctly.
+    display.display();
+    delay(2000);
+    // --- End Splash Screen ---
+
+    display.clearDisplay(); display.display(); delay(50);
+
+    int initialPotValue = analogRead(POT_PIN);
+    windSpeed = map(initialPotValue, 0, 4095, -MAX_WIND_SPEED, MAX_WIND_SPEED);
+    Serial.print("Initial Wind Speed: "); Serial.println(windSpeed);
+
+    int initialSwitchState = digitalRead(SWITCH_PIN);
+    if (initialSwitchState == LOW) { currentParticleMode = SNOW; Serial.println("Initial mode: Snow"); }
+    else { currentParticleMode = RAIN; Serial.println("Initial mode: Rain"); }
+
+    // Kar birikimini sıfırdan başlat (katı platform)
+    clearSnowAccumulation();
+
+    for (int i = 0; i < NUM_DROPS; i++) { resetDrop(i); }
+}
+
+// --- Helper Function to Clear Snow ---
+void clearSnowAccumulation() {
+    // Katı platform için her yeri 0 yap
+    memset(snowAccumulation, 0, sizeof(snowAccumulation));
+}
+
+// --- Reset Drop Function ---
+// (Unchanged)
+void resetDrop(int i) {
+    int min_x, max_x;
+    if (windSpeed > 0) { min_x = -WIND_COMPENSATION_BUFFER; max_x = SCREEN_WIDTH; }
+    else if (windSpeed < 0) { min_x = 0; max_x = SCREEN_WIDTH + WIND_COMPENSATION_BUFFER; }
+    else { min_x = 0; max_x = SCREEN_WIDTH; }
+    drops[i].x = random(min_x, max_x);
+    drops[i].y = random(-(SCREEN_HEIGHT / 2), 0);
+    if (currentParticleMode == RAIN) { drops[i].speed = random(4, 10); drops[i].length = random(2, 5); drops[i].bouncing = false; drops[i].bounceDirection = 1; }
+    else { drops[i].speed = random(1, 3); drops[i].length = 1; drops[i].bouncing = false; }
+    drops[i].bounceCount = 0;
+}
+
+// --- Main Loop ---
+void loop() {
+    // ... (Potansiyometre, Mod Değiştirme - Değişiklik Yok) ...
+    int potValue = analogRead(POT_PIN); windSpeed =2;// map(potValue, 0, 4095, -MAX_WIND_SPEED, MAX_WIND_SPEED);
+    int switchState = digitalRead(SWITCH_PIN); ParticleMode targetMode = (switchState == LOW) ? SNOW : RAIN;
+    if (targetMode != currentParticleMode) { currentParticleMode = targetMode; Serial.print("Mode changed to: "); Serial.println(currentParticleMode == RAIN ? "Rain" : "Snow"); for (int i = 0; i < NUM_DROPS; i++) { resetDrop(i); } clearSnowAccumulation(); }
+    // ... --- ...
+
+    // SH110X requires clearing the buffer before drawing new frame content
+    display.clearDisplay();
+
+    // --- KATI Platformu Çiz ---
+    // Use SH110X_WHITE (although SSD1306_WHITE might be defined identically)
+    display.drawRect(PLATFORM_X, PLATFORM_Y, PLATFORM_WIDTH, PLATFORM_HEIGHT, SH110X_WHITE);
+
+    // --- Kar Birikintisini Çiz (Platform Üstünde) ---
+    if (currentParticleMode == SNOW) {
+         for (int x = 0; x < SCREEN_WIDTH; x++) {
+             int total_snow_height = snowAccumulation[x]; // Mutlak yükseklik (y=63'ten)
+             if (total_snow_height <= 0) continue; // Kar yoksa çizme
+
+             bool on_platform = (x >= PLATFORM_X && x < PLATFORM_X + PLATFORM_WIDTH);
+             // Karın başlayacağı mutlak Y koordinatı
+             int snow_start_y = SCREEN_HEIGHT - total_snow_height;
+             // Çizilecek karın yüksekliği
+             int snow_draw_height = total_snow_height;
+
+             // Platform üzerindeysek, çizimi platformun üstüyle sınırla
+             if (on_platform) {
+                  // Kar platformun altından mı başlıyor? (Olmamalı ama kontrol)
+                  if (snow_start_y >= PLATFORM_Y + PLATFORM_HEIGHT) continue; // Çizme
+
+                  // Kar platformun üstünden mi başlıyor?
+                  if (snow_start_y < PLATFORM_Y) {
+                      snow_draw_height = total_snow_height - (SCREEN_HEIGHT - PLATFORM_Y); // Platformun üstündeki kısım
+                       snow_start_y = PLATFORM_Y; // Başlangıcı platformun üstü yap
+                  } else {
+                       // Kar platformun altında ama üstünden değil (yani kar yok) -> Mantık hatası?
+                       // Bu durum olmamalı. Kar birikimi platform Y'nin altına inmemeli.
+                       // Güvenlik: Eğer kar platformun altında başlıyorsa çizme.
+                       if (snow_start_y >= PLATFORM_Y) continue;
+                  }
+             }
+
+             // Güvenlik ve Kırpma
+             if (snow_draw_height > 0 && snow_start_y < SCREEN_HEIGHT) {
+                  if (snow_start_y < 0) { // Ekranın üstünden kırp
+                       snow_draw_height += snow_start_y;
+                       snow_start_y = 0;
+                  }
+                  if (snow_start_y + snow_draw_height > SCREEN_HEIGHT) { // Ekranın altından kırp
+                       snow_draw_height = SCREEN_HEIGHT - snow_start_y;
+                  }
+                  if (snow_draw_height > 0) { // Son kontrol
+                       // Use SH110X_WHITE
+                       display.drawFastVLine(x, snow_start_y, snow_draw_height, SH110X_WHITE);
+                  }
+             }
+         }
+    }
+    // --- Bitiş Kar Çizimi ---
+
+    // Process and Draw Drops
+    for (int i = 0; i < NUM_DROPS; i++) {
+
+        int current_x = drops[i].x;
+        int current_y = drops[i].y;
+        bool on_platform_area_current = (current_x >= PLATFORM_X && current_x < PLATFORM_X + PLATFORM_WIDTH);
+
+        // --- Ortak Yatay Sınır Kontrolü ---
+        #if BOUNDARY_BEHAVIOR == 1
+            if (current_x >= SCREEN_WIDTH) drops[i].x = current_x = 0;
+            if (current_x < 0) drops[i].x = current_x = SCREEN_WIDTH - 1;
+        #elif BOUNDARY_BEHAVIOR == 0
+            if (current_x >= SCREEN_WIDTH || current_x < 0) { resetDrop(i); continue; }
+        #endif
+         on_platform_area_current = (current_x >= PLATFORM_X && current_x < PLATFORM_X + PLATFORM_WIDTH);
+        // --- ---
+
+        if (currentParticleMode == RAIN) {
+            // --- RAIN LOGIC (KATI PLATFORM) ---
+
+            // --- Rain Drawing ---
+            // Use SH110X_WHITE
+            if (drops[i].bouncing) { if (current_y >=0 && current_y < SCREEN_HEIGHT) display.drawPixel(current_x, current_y , SH110X_WHITE); }
+            else { if (current_y + drops[i].length >= 0 && current_y < SCREEN_HEIGHT) { int endX = current_x + windSpeed; display.drawLine(current_x, current_y, endX, current_y + drops[i].length, SH110X_WHITE); } }
+            // --- End Rain Drawing ---
+
+            // --- Rain Update State (Logic Unchanged) ---
+            if (drops[i].bouncing) { // Sekme Mantığı
+                int next_bounce_y = current_y - drops[i].speed;
+                int next_bounce_x = current_x + drops[i].bounceDirection * (abs(windSpeed)/2 + 1);
+
+                // Sonraki X'i sınırlar içinde kontrol et
+                int check_x = next_bounce_x;
+                #if BOUNDARY_BEHAVIOR == 1
+                    if (check_x >= SCREEN_WIDTH) next_bounce_x = check_x = 0;
+                    if (check_x < 0) next_bounce_x = check_x = SCREEN_WIDTH - 1;
+                #elif BOUNDARY_BEHAVIOR == 0
+                    if (check_x >= SCREEN_WIDTH || check_x < 0) { resetDrop(i); continue; }
+                #endif
+                bool next_on_platform = (check_x >= PLATFORM_X && check_x < PLATFORM_X + PLATFORM_WIDTH);
+
+                // Sekerken KATI platforma çarpma (İçine girerse sıfırla)
+                if (next_on_platform && next_bounce_y >= PLATFORM_Y && next_bounce_y < PLATFORM_Y + PLATFORM_HEIGHT) {
+                    resetDrop(i); continue;
+                }
+
+                // Hareketi uygula
+                drops[i].y = next_bounce_y;
+                drops[i].x = next_bounce_x;
+                drops[i].speed--;
+
+                // Sekme bitti mi veya yukarıdan çıktı mı?
+                if (drops[i].speed <= 0 || drops[i].y < 0) { resetDrop(i); continue; }
+
+            } else { // Düşme Mantığı
+                int next_y = current_y + drops[i].speed;
+                int next_x = current_x + windSpeed;
+                int y_bottom = current_y + drops[i].length;
+                int next_y_bottom = next_y + drops[i].length;
+
+                // Sonraki X'i sınırlar içinde kontrol et
+                int check_x = next_x;
+                #if BOUNDARY_BEHAVIOR == 1
+                    if (check_x >= SCREEN_WIDTH) next_x = check_x = 0;
+                    if (check_x < 0) next_x = check_x = SCREEN_WIDTH - 1;
+                #elif BOUNDARY_BEHAVIOR == 0
+                    if (check_x >= SCREEN_WIDTH || check_x < 0) { resetDrop(i); continue; }
+                #endif
+                bool next_on_platform = (check_x >= PLATFORM_X && check_x < PLATFORM_X + PLATFORM_WIDTH);
+
+                bool hit_surface = false;
+
+                // KATI Platform Çarpışma Kontrolü
+                if (next_on_platform) {
+                    // ÜSTÜNE Çarpma
+                    if (next_y_bottom >= PLATFORM_Y && y_bottom < PLATFORM_Y) {
+                        drops[i].y = PLATFORM_Y - drops[i].length;
+                        drops[i].bouncing = true;
+                        drops[i].bounceCount++; drops[i].speed = random(2, 5);
+                        if (windSpeed > 0) drops[i].bounceDirection = 1; else if (windSpeed < 0) drops[i].bounceDirection = -1; else drops[i].bounceDirection = (random(0, 2) == 0) ? -1 : 1;
+                        hit_surface = true;
+                        #if BOUNDARY_BEHAVIOR == 0
+                           if ((check_x <= PLATFORM_X && drops[i].bounceDirection < 0) || (check_x >= PLATFORM_X + PLATFORM_WIDTH - 1 && drops[i].bounceDirection > 0)) { resetDrop(i); continue; }
+                        #endif
+                    }
+                    // YANINA Çarpma (Üstüne çarpmadıysa)
+                    else if (!hit_surface && max(current_y, next_y_bottom) >= PLATFORM_Y && min(current_y, next_y) < PLATFORM_Y + PLATFORM_HEIGHT) { // Y ekseninde kesişim
+                          // Soldan çarpma
+                          if (current_x < PLATFORM_X && check_x >= PLATFORM_X) { resetDrop(i); hit_surface = true; continue;}
+                          // Sağdan çarpma
+                          if (current_x >= PLATFORM_X + PLATFORM_WIDTH && check_x < PLATFORM_X + PLATFORM_WIDTH) { resetDrop(i); hit_surface = true; continue;}
+                          // Zaten yatay olarak içindeyse (hata durumu, olmamalı)
+                          //if(on_platform_area_current) { resetDrop(i); hit_surface = true; continue;}
+                    }
+                }
+
+                // Zemin Çarpışma Kontrolü
+                if (!hit_surface && next_y_bottom >= SCREEN_HEIGHT - 1) {
+                    drops[i].y = SCREEN_HEIGHT - 1 - drops[i].length;
+                    drops[i].bouncing = true;
+                    drops[i].bounceCount++; drops[i].speed = random(2, 5);
+                    if (windSpeed > 0) drops[i].bounceDirection = 1; else if (windSpeed < 0) drops[i].bounceDirection = -1; else drops[i].bounceDirection = (random(0, 2) == 0) ? -1 : 1;
+                    hit_surface = true;
+                    #if BOUNDARY_BEHAVIOR == 0
+                         if ((check_x <= 0 && drops[i].bounceDirection < 0) || (check_x >= SCREEN_WIDTH - 1 && drops[i].bounceDirection > 0)) { resetDrop(i); continue; }
+                    #endif
+                }
+
+                // Eğer çarpışma olmadıysa, normal hareketi uygula
+                 if (!hit_surface) {
+                    drops[i].y = next_y;
+                    drops[i].x = next_x;
+                 }
+                 else if (drops[i].y >= SCREEN_HEIGHT) { // Çarptıktan sonra bile ekran dışına çıkarsa
+                     resetDrop(i); continue;
+                 }
+            }
+            // --- End Rain Update State ---
+
+        } else { // currentParticleMode == SNOW
+            // --- SNOW LOGIC (KATI PLATFORM) ---
+
+            // --- Snow Drawing (Pixel) ---
+            // Use SH110X_WHITE
+             if (current_y >= 0 && current_y < SCREEN_HEIGHT) { display.drawPixel(current_x, current_y, SH110X_WHITE); }
+            // --- End Snow Drawing ---
+
+            // --- Snow Update State (Logic Unchanged) ---
+            int next_y = current_y + drops[i].speed;
+            int next_x = current_x + windSpeed + random(-1, 2);
+
+             // Yatay sınırları flutter sonrası tekrar kontrol et
+             int check_x = next_x;
+             #if BOUNDARY_BEHAVIOR == 1
+                if (check_x >= SCREEN_WIDTH) next_x = check_x = 0;
+                if (check_x < 0) next_x = check_x = SCREEN_WIDTH - 1;
+             #elif BOUNDARY_BEHAVIOR == 0
+                 if (check_x >= SCREEN_WIDTH || check_x < 0) { resetDrop(i); continue; }
+             #endif
+             bool on_platform = (check_x >= PLATFORM_X && check_x < PLATFORM_X + PLATFORM_WIDTH);
+
+
+            // KATI Platform için Kar Birikme Yüzeyi Tespiti
+            int target_surface_y;
+            int current_total_snow_height = snowAccumulation[check_x];
+            // Kar yüzeyinin mutlak Y'si (0=top, 63=bottom)
+            int snow_surface_absolute_y = SCREEN_HEIGHT - 1 - current_total_snow_height;
+
+            if (on_platform) {
+                // Platformdaysa, hedef yüzey platformun üstü (PLATFORM_Y-1) veya üzerindeki karın yüzeyidir (hangisi daha yüksekse/düşük Y ise)
+                target_surface_y = min(PLATFORM_Y - 1, snow_surface_absolute_y);
+            } else {
+                // Zemindeyse, hedef yüzey karın yüzeyidir
+                target_surface_y = snow_surface_absolute_y;
+            }
+
+
+            if (next_y >= target_surface_y) {
+                 // Platformun YANINA çarpma kontrolü (kar için basitçe sıfırlama)
+                 if (on_platform && max(current_y, next_y) >= PLATFORM_Y && min(current_y, next_y) < PLATFORM_Y + PLATFORM_HEIGHT) { // Y ekseninde kesişim
+                       // Soldan çarpma
+                       if (current_x < PLATFORM_X && check_x >= PLATFORM_X) { resetDrop(i); continue;}
+                       // Sağdan çarpma
+                       if (current_x >= PLATFORM_X + PLATFORM_WIDTH && check_x < PLATFORM_X + PLATFORM_WIDTH) { resetDrop(i); continue;}
+                 }
+
+
+                // Sadece MAX_SNOW_HEIGHT'a ulaşılmadıysa biriktir
+                // platformun üstündeki kar için toplam yükseklik sınırı
+                int platform_top_level_height = SCREEN_HEIGHT - PLATFORM_Y; // y=63'ten platformun üstüne olan yükseklik
+                 // int max_allowed_height = on_platform ? (platform_top_level_height + MAX_SNOW_HEIGHT) : MAX_SNOW_HEIGHT; // This calculation was potentially complex/buggy let's stick to the simpler one for now
+
+
+                 int current_height_on_base = on_platform ? (snowAccumulation[check_x] - platform_top_level_height) : snowAccumulation[check_x];
+                 if (current_height_on_base < 0) current_height_on_base = 0; // Güvenlik
+
+                 if (current_height_on_base < MAX_SNOW_HEIGHT) {
+
+                    snowAccumulation[check_x]++;
+
+                    // Yayılma Mantığı (Logic Unchanged)
+                     int max_accum_height_left = MAX_SNOW_HEIGHT + ( (check_x - 1 >= PLATFORM_X && check_x - 1 < PLATFORM_X + PLATFORM_WIDTH) ? platform_top_level_height : 0 ) ;
+                     int max_accum_height_right = MAX_SNOW_HEIGHT + ( (check_x + 1 >= PLATFORM_X && check_x + 1 < PLATFORM_X + PLATFORM_WIDTH) ? platform_top_level_height : 0 ) ;
+
+                     // Sol
+                     if (check_x > 0) {
+                         if (snowAccumulation[check_x] > snowAccumulation[check_x - 1] + SNOW_SPILL_THRESHOLD) {
+                             if (snowAccumulation[check_x - 1] < max_accum_height_left) {
+                                 snowAccumulation[check_x]--;
+                                 snowAccumulation[check_x - 1]++;
+                            }
+                         }
+                     }
+                     // Sağ
+                     if (check_x < SCREEN_WIDTH - 1) {
+                         if (snowAccumulation[check_x] > snowAccumulation[check_x + 1] + SNOW_SPILL_THRESHOLD) {
+                             if(snowAccumulation[check_x + 1] < max_accum_height_right) {
+                                 snowAccumulation[check_x]--;
+                                 snowAccumulation[check_x + 1]++;
+                             }
+                         }
+                     }
+                     // --- Bitiş Yayılma ---
+                 }
+                // } // End of original complex max height check
+
+
+                resetDrop(i); // Kar tanesini sıfırla
+                continue;     // Döngünün geri kalanını atla
+            } else {
+                 // Çarpışma olmadıysa, hareketi uygula
+                 drops[i].y = next_y;
+                 drops[i].x = next_x;
+            }
+            // --- End Kar Birikme ---
+
+            // --- End Snow Update State ---
+
+        } // End if/else for particle mode
+
+    } // End for loop over drops
+
+
+    // --- Snow Melting Logic (Logic Unchanged)---
+    if (currentParticleMode == SNOW) {
+        frameCounter++;
+        if (frameCounter >= MELT_CHECK_INTERVAL) {
+             frameCounter = 0;
+             for (int x = 0; x < SCREEN_WIDTH; x++) {
+                 bool on_platform = (x >= PLATFORM_X && x < PLATFORM_X + PLATFORM_WIDTH);
+                 // Erime için minimum yükseklik (y=63'ten itibaren)
+                 // Platformdaysa, platformun üst yüzeyinin yüksekliği
+                 int min_height = on_platform ? (SCREEN_HEIGHT - PLATFORM_Y) : 0;
+
+                 if (snowAccumulation[x] > min_height) {
+                     if (random(0, 100) < MELT_PROBABILITY_PERCENT) {
+                         snowAccumulation[x]--;
+                     }
+                 }
+                 // Güvenlik: Erime sonucu minimumun altına düştüyse düzelt
+                 if (snowAccumulation[x] < min_height) {
+                    snowAccumulation[x] = min_height;
+                 }
+             }
+         }
+    }
+    // --- End Snow Melting ---
+
+    // **IMPORTANT for SH1106/SH1107:** Push the entire frame buffer to the display
+    display.display();
+    delay(25); // Keep a small delay for animation smoothness and to avoid overwhelming the MCU/display
+}
